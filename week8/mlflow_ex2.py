@@ -1,113 +1,87 @@
-# pip install mlflow google-generativeai
-# Get free API key at: https://aistudio.google.com
 import mlflow
-import mlflow.gemini          # MLflow 3.0 native Gemini integration
-import google.generativeai as genai
-import os
+import mlflow.xgboost
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+from mlflow import MlflowClient
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
 
-# ── SETUP ─────────────────────────────────────────────────────────────────────
+# ── 1. SETUP ──────────────────────────────────────────────────────────────────
 mlflow.set_tracking_uri("http://localhost:5001")
-mlflow.set_experiment("imdb-sentiment-llm-gemini")
+mlflow.set_experiment("retail-demand-forecasting")
+client = MlflowClient()
+model_name = "retail-demand-forecasting-model"
 
-# Configure Gemini with your free API key from aistudio.google.com
-genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+# ── 2. DATA GENERATION ────────────────────────────────────────────────────────
+def generate_data(n=10000):
+    np.random.seed(42)
+    data = pd.DataFrame({
+        'day_of_week': np.random.randint(0, 7, n),
+        'promo_active': np.random.randint(0, 2, n),
+        'dept_id': np.random.randint(1, 50, n),
+        'inventory_level': np.random.uniform(10, 1000, n)
+    })
+    # Target: Sales (influenced by features + some noise)
+    data['sales'] = (data['promo_active'] * 50) + (data['inventory_level'] * 0.1) + np.random.normal(0, 5, n)
+    return data
 
-# ── ENABLE TRACING ────────────────────────────────────────────────────────────
-# MLflow 3.0 automatically captures every Gemini call:
-# - full prompt (system + user messages)
-# - full response text
-# - token usage (input / output / total)
-# - latency per call
-# - model name and generation config
-# Visible under the "Traces" tab in the MLflow UI.
-mlflow.gemini.autolog()
+df = generate_data()
+X = df.drop('sales', axis=1)
+y = df['sales']
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
-# The system prompt is the "model" in an LLM pipeline.
-# Logging it as an artifact lets you version and compare prompts
-# across runs — just like you'd compare hyperparameters in traditional ML.
-SYSTEM_PROMPT = """You are a sentiment classifier for movie reviews.
-
-Classify the review as exactly one of:
-  POSITIVE — the reviewer liked the movie
-  NEGATIVE — the reviewer disliked the movie
-
-Rules:
-- Reply with only the label: POSITIVE or NEGATIVE
-- No explanations, no punctuation, nothing else."""
-
-# Few-shot examples are included in the user message to improve accuracy.
-FEW_SHOT_EXAMPLES = """Examples:
-Review: "A breathtaking cinematic experience."
-Label: POSITIVE
-
-Review: "Painfully boring and poorly written."
-Label: NEGATIVE"""
-
-# ── CLASSIFIER FUNCTION ───────────────────────────────────────────────────────
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash", # free tier model
-    system_instruction=SYSTEM_PROMPT
-)
-
-@mlflow.trace  # marks this function as a named span in the trace
-def classify_review(review: str) -> str:
-    """Classify a single review as POSITIVE or NEGATIVE using Gemini."""
-    prompt = f"{FEW_SHOT_EXAMPLES}\n\nReview: \"{review}\"\nLabel:"
-
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.GenerationConfig(
-            temperature=0.0,   # deterministic output — critical for classifiers
-            max_output_tokens=10,
-        )
-    )
-    return response.text.strip()
-
-@mlflow.trace
-def run_batch(reviews: list[str]) -> list[str]:
-    """Classify a batch of reviews and return predictions."""
-    results = []
-    for review in reviews:
-        results.append(classify_review(review))
-        time.sleep(60)
-    return results
-
-# ── EVALUATION DATASET ────────────────────────────────────────────────────────
-test_reviews = [
-    ("I walked out after 20 minutes. Absolutely dreadful.",              "NEGATIVE"),
-    ("Funny, clever, and thoroughly entertaining.",                       "POSITIVE"),
+# ── 3. THE TOURNAMENT (Hyperparameter Sweep) ──────────────────────────────────
+param_grid = [
+    {"max_depth": 3, "learning_rate": 0.1, "n_estimators": 100},
+    {"max_depth": 6, "learning_rate": 0.01, "n_estimators": 200},
+    {"max_depth": 10, "learning_rate": 0.05, "n_estimators": 150}
 ]
 
-# ── RUN & LOG ─────────────────────────────────────────────────────────────────
-with mlflow.start_run(run_name="gemini-flash-fewshot"):
+print("🚀 Starting model tournament...")
 
-    # Log the prompt as a versioned artifact.
-    # Changing the prompt = new run = easy A/B comparison in the UI.
-    mlflow.log_text(SYSTEM_PROMPT,     artifact_file="system_prompt.txt")
-    mlflow.log_text(FEW_SHOT_EXAMPLES, artifact_file="few_shot_examples.txt")
+for params in param_grid:
+    with mlflow.start_run(run_name=f"xgb-depth-{params['max_depth']}"):
+        
+        # Train
+        model = xgb.XGBRegressor(**params)
+        model.fit(X_train, y_train)
+        
+        # Evaluate
+        preds = model.predict(X_test)
+        rmse = np.sqrt(mean_squared_error(y_test, preds))
+        
+        # Log to MLflow
+        mlflow.log_params(params)
+        mlflow.log_metrics({"rmse": rmse})
+        
+        # Log the actual model artifact
+        mlflow.xgboost.log_model(model, artifact_path="forecast-model")
+        
+        print(f"Finished: Depth={params['max_depth']} | RMSE={rmse:.4f}")
 
-    mlflow.log_params({
-        "model"      : "gemini-2.0-flash",
-        "temperature": 0.0,
-        "n_shots"    : 4,
-        "strategy"   : "few-shot",
-    })
+# ── 4. AUTOMATED CHAMPION PROMOTION ──────────────────────────────────────────
+print("\n🔍 Analyzing results to find the Champion...")
 
-    # Run batch classification — each Gemini call is traced automatically
-    reviews    = [r for r, _ in test_reviews]
-    gold_labels = [l for _, l in test_reviews]
-    predictions = run_batch(reviews)
+# Search for the best run in the experiment based on lowest RMSE
+experiment = client.get_experiment_by_name("retail-demand-forecasting")
+runs = client.search_runs(
+    experiment_ids=[experiment.experiment_id],
+    order_by=["metrics.rmse ASC"], 
+    max_results=1
+)
 
-    # Compute and log accuracy
-    correct  = sum(p == g for p, g in zip(predictions, gold_labels))
-    accuracy = correct / len(gold_labels)
-    mlflow.log_metric("accuracy", accuracy)
+best_run = runs[0]
+best_run_id = best_run.info.run_id
+best_rmse = best_run.data.metrics['rmse']
 
-    # Log per-review results for detailed inspection
-    for i, (review, gold, pred) in enumerate(zip(reviews, gold_labels, predictions)):
-        match = "✓" if pred == gold else "✗"
-        print(f"{match} [{gold:8s} → {pred:8s}] {review[:60]}...")
+print(f"🏆 Best Run Found: {best_run_id} (RMSE: {best_rmse:.4f})")
 
-    print(f"\nAccuracy: {accuracy:.2f} ({correct}/{len(gold_labels)})")
-    print("Check traces at http://localhost:5001 → Traces tab")
+# Register the model version in the Model Registry
+model_uri = f"runs:/{best_run_id}/forecast-model"
+mv = mlflow.register_model(model_uri, model_name)
+
+# Assign the 'champion' alias to this version
+client.set_registered_model_alias(model_name, "champion", mv.version)
+
+print(f"✅ Version {mv.version} of '{model_name}' is now the 'champion'!")
